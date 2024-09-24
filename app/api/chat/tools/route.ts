@@ -15,7 +15,12 @@ export async function POST(request: Request) {
   }
 
   try {
+    console.log("Fetching server profile...")
     const profile = await getServerProfile()
+    console.log("Server profile fetched:", profile)
+
+    // Log the environment variable directly
+    console.log("Environment OPENAI_API_KEY:", process.env.OPENAI_API_KEY)
 
     checkApiKey(profile.openai_api_key, "OpenAI")
 
@@ -24,15 +29,24 @@ export async function POST(request: Request) {
       organization: profile.openai_organization_id
     })
 
+    // Log the API key to debug
+    console.log("Using OpenAI API Key:", profile.openai_api_key)
+
     let allTools: OpenAI.Chat.Completions.ChatCompletionTool[] = []
     let allRouteMaps = {}
     let schemaDetails = []
 
     for (const selectedTool of selectedTools) {
       try {
+        console.log("Converting schema for tool:", selectedTool.name)
         const convertedSchema = await openapiToFunctions(
           JSON.parse(selectedTool.schema as string)
         )
+        console.log(
+          "Schema converted successfully for tool:",
+          selectedTool.name
+        )
+
         const tools = convertedSchema.functions || []
         allTools = allTools.concat(tools)
 
@@ -55,15 +69,21 @@ export async function POST(request: Request) {
           requestInBody: convertedSchema.routes[0].requestInBody
         })
       } catch (error: any) {
-        console.error("Error converting schema", error)
+        console.error(
+          "Error converting schema for tool:",
+          selectedTool.name,
+          error
+        )
       }
     }
 
+    console.log("Sending request to OpenAI for chat completion...")
     const firstResponse = await openai.chat.completions.create({
       model: chatSettings.model as ChatCompletionCreateParamsBase["model"],
       messages,
       tools: allTools.length > 0 ? allTools : undefined
     })
+    console.log("Received response from OpenAI:", firstResponse)
 
     const message = firstResponse.choices[0].message
     messages.push(message)
@@ -84,7 +104,8 @@ export async function POST(request: Request) {
         const argumentsString = toolCall.function.arguments.trim()
         const parsedArgs = JSON.parse(argumentsString)
 
-        // Find the schema detail that contains the function name
+        console.log("Processing tool call:", functionName)
+
         const schemaDetail = schemaDetails.find(detail =>
           Object.values(detail.routeMap).includes(functionName)
         )
@@ -115,65 +136,85 @@ export async function POST(request: Request) {
           throw new Error(`Path for function ${functionName} not found`)
         }
 
-        // Determine if the request should be in the body or as a query
         const isRequestInBody = schemaDetail.requestInBody
         let data = {}
 
         if (isRequestInBody) {
-          // If the type is set to body
           let headers = {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${profile.openai_api_key}`
           }
 
-          // Check if custom headers are set
-          const customHeaders = schemaDetail.headers // Moved this line up to the loop
-          // Check if custom headers are set and are of type string
+          const customHeaders = schemaDetail.headers
           if (customHeaders && typeof customHeaders === "string") {
             let parsedCustomHeaders = JSON.parse(customHeaders) as Record<
               string,
               string
             >
-
             headers = {
               ...headers,
               ...parsedCustomHeaders
             }
           }
 
-          const fullUrl = schemaDetail.url + path
+          let fullUrl = schemaDetail.url + path
+
+          // Force correct DALLE endpoint
+          if (fullUrl.includes("/v1/images/generations")) {
+            fullUrl = "https://api.openai.com/v1/images/generations"
+          }
 
           const bodyContent = parsedArgs.requestBody || parsedArgs
+
+          // Log the API key and request details before making the request
+          console.log("Using API Key for request:", profile.openai_api_key)
+          console.log(
+            "Sending POST request to:",
+            fullUrl,
+            "with body:",
+            bodyContent
+          )
 
           const requestInit = {
             method: "POST",
             headers,
-            body: JSON.stringify(bodyContent) // Use the extracted requestBody or the entire parsedArgs
+            body: JSON.stringify(bodyContent)
           }
 
           const response = await fetch(fullUrl, requestInit)
 
           if (!response.ok) {
+            const errorData = await response.json()
+            console.error(
+              "Error from DALLE API:",
+              response.statusText,
+              errorData
+            )
             data = {
-              error: response.statusText
+              error: response.statusText,
+              details: errorData
             }
           } else {
             data = await response.json()
+            console.log("Received response from DALLE image generation:", data)
           }
         } else {
-          // If the type is set to query
           const queryParams = new URLSearchParams(
             parsedArgs.parameters
           ).toString()
           const fullUrl =
             schemaDetail.url + path + (queryParams ? "?" + queryParams : "")
 
-          let headers = {}
+          let headers = {
+            Authorization: `Bearer ${profile.openai_api_key}`
+          }
 
-          // Check if custom headers are set
           const customHeaders = schemaDetail.headers
           if (customHeaders && typeof customHeaders === "string") {
             headers = JSON.parse(customHeaders)
           }
+
+          console.log("Sending GET request to:", fullUrl)
 
           const response = await fetch(fullUrl, {
             method: "GET",
@@ -181,11 +222,19 @@ export async function POST(request: Request) {
           })
 
           if (!response.ok) {
+            const errorData = await response.json()
+            console.error(
+              "Error from DALLE API:",
+              response.statusText,
+              errorData
+            )
             data = {
-              error: response.statusText
+              error: response.statusText,
+              details: errorData
             }
           } else {
             data = await response.json()
+            console.log("Received response from DALLE image generation:", data)
           }
         }
 
@@ -198,21 +247,24 @@ export async function POST(request: Request) {
       }
     }
 
+    console.log("Sending second request to OpenAI for chat completion...")
     const secondResponse = await openai.chat.completions.create({
       model: chatSettings.model as ChatCompletionCreateParamsBase["model"],
       messages,
       stream: true
     })
+    console.log("Received streaming response from OpenAI")
 
     const stream = OpenAIStream(secondResponse)
 
     return new StreamingTextResponse(stream)
   } catch (error: any) {
-    console.error(error)
+    console.error("Error in POST handler:", error)
     const errorMessage = error.error?.message || "An unexpected error occurred"
     const errorCode = error.status || 500
     return new Response(JSON.stringify({ message: errorMessage }), {
-      status: errorCode
+      status: errorCode,
+      headers: { "Content-Type": "application/json" }
     })
   }
 }
